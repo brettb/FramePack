@@ -276,7 +276,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
             if not high_vram:
-                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
+                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=4)
                 load_model_as_complete(vae, target_device=gpu)
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
