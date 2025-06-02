@@ -267,7 +267,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             # Always unload models after decoding to free up memory
             unload_complete_models(vae)
             torch.cuda.empty_cache()
-            offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=4)
+            offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
             torch.cuda.empty_cache()
             # Load VAE in smaller chunks by enabling slicing and tiling
             vae.enable_slicing()
