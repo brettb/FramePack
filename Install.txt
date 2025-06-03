@@ -1,3 +1,3 @@
-A note on installation, this fork  is optimized for Sageattention. You can still use Flash attention however will need to uncomment the flash-attn line in requirements.txt
+A note on installation, this fork is optimized for Sageattention. You can still use Flash attention however will need to uncomment the flash-attn line in requirements.txt
 
 For best performance, we recommend using SageAttention. You can always bypass SageAttention by setting the environment variable USE_SAGE_ATTENTION=0 or launching with --no-use_sage_attention after launching your chosen demo.
