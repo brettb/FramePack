@@ -20,33 +20,32 @@ from diffusers_helper.utils import zero_module
 
 enabled_backends = []
 
-if torch.backends.cuda.flash_sdp_enabled():
+# Check for available SDP backends in a way that's compatible with different PyTorch versions
+if hasattr(torch.backends.cuda, 'flash_sdp_enabled') and torch.backends.cuda.flash_sdp_enabled():
     enabled_backends.append("flash")
-if torch.backends.cuda.math_sdp_enabled():
+if hasattr(torch.backends.cuda, 'math_sdp_enabled') and torch.backends.cuda.math_sdp_enabled():
     enabled_backends.append("math")
-if torch.backends.cuda.mem_efficient_sdp_enabled():
+if hasattr(torch.backends.cuda, 'mem_efficient_sdp_enabled') and torch.backends.cuda.mem_efficient_sdp_enabled():
     enabled_backends.append("mem_efficient")
-if torch.backends.cuda.cudnn_sdp_enabled():
+# Check for cudnn_sdp_enabled with a fallback for newer PyTorch versions
+if hasattr(torch.backends.cuda, 'cudnn_sdp_enabled') and torch.backends.cuda.cudnn_sdp_enabled():
     enabled_backends.append("cudnn")
 
 print("Currently enabled native sdp backends:", enabled_backends)
 
 try:
-    # raise NotImplementedError
-    from xformers.ops import memory_efficient_attention as xformers_attn_func
-    print('Xformers is installed!')
+    import sageattention
+    from sageattention import sageattn
+    print('SageAttention is installed!')
+    print(f"SageAttention path: {sageattention.__file__}")
+    SAGEATTN_AVAILABLE = True
+except ImportError as e:
+    print(f'SageAttention import error: {e}')
+    print('SageAttention is not installed. Install it for better performance.')
+    SAGEATTN_AVAILABLE = False
 except:
-    print('Xformers is not installed!')
-    xformers_attn_func = None
-
-try:
-    # raise NotImplementedError
-    from flash_attn import flash_attn_varlen_func, flash_attn_func
-    print('Flash Attn is installed!')
-except:
-    print('Flash Attn is not installed!')
-    flash_attn_varlen_func = None
-    flash_attn_func = None
+    print('SageAttention is not installed. Install it for better performance.')
+    SAGEATTN_AVAILABLE = False
 
 try:
     # raise NotImplementedError
@@ -139,6 +138,87 @@ def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seq
 
     return x
 
+class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin):
+    @register_to_config
+    def __init__(
+        self,
+        in_channels: int = 16,
+        out_channels: int = 16,
+        num_attention_heads: int = 24,
+        attention_head_dim: int = 128,
+        num_layers: int = 20,
+        num_single_layers: int = 40,
+        num_refiner_layers: int = 2,
+        mlp_ratio: float = 4.0,
+        patch_size: int = 2,
+        patch_size_t: int = 1,
+        qk_norm: str = "rms_norm",
+        guidance_embeds: bool = True,
+        text_embed_dim: int = 4096,
+        pooled_projection_dim: int = 768,
+        rope_theta: float = 256.0,
+        rope_axes_dim: Tuple[int] = (16, 56, 56),
+        has_image_proj=False,
+        image_proj_dim=1152,
+        has_clean_x_embedder=False,
+        use_sage_attention: bool = False,
+    ) -> None:
+        super().__init__()
+
+        inner_dim = num_attention_heads * attention_head_dim
+        out_channels = out_channels or in_channels
+
+        # 1. Latent and condition embedders
+        self.x_embedder = HunyuanVideoPatchEmbed((patch_size_t, patch_size, patch_size), in_channels, inner_dim)
+        self.context_embedder = HunyuanVideoTokenRefiner(
+            text_embed_dim, num_attention_heads, attention_head_dim, num_layers=num_refiner_layers
+        )
+        self.time_text_embed = CombinedTimestepGuidanceTextProjEmbeddings(inner_dim, pooled_projection_dim)
+
+        self.clean_x_embedder = None
+        self.image_projection = None
+
+        # 2. RoPE
+        self.rope = HunyuanVideoRotaryPosEmbed(rope_axes_dim, rope_theta)
+
+        # 3. Dual stream transformer blocks
+        self.transformer_blocks = nn.ModuleList(
+            [
+                HunyuanVideoTransformerBlock(
+                    num_attention_heads, attention_head_dim, mlp_ratio=mlp_ratio, qk_norm=qk_norm,
+                    use_sage_attention=use_sage_attention
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        # 4. Single stream transformer blocks
+        self.single_transformer_blocks = nn.ModuleList(
+            [
+                HunyuanVideoSingleTransformerBlock(
+                    num_attention_heads, attention_head_dim, mlp_ratio=mlp_ratio, qk_norm=qk_norm,
+                    use_sage_attention=use_sage_attention
+                )
+                for _ in range(num_single_layers)
+            ]
+        )
+
+        # 5. Output projection
+        self.norm_out = AdaLayerNormContinuous(inner_dim, inner_dim, elementwise_affine=False, eps=1e-6)
+        self.proj_out = nn.Linear(inner_dim, patch_size_t * patch_size * patch_size * out_channels)
+
+        self.inner_dim = inner_dim
+        self.use_gradient_checkpointing = False
+        self.enable_teacache = False
+
+        if has_image_proj:
+            self.install_image_projection(image_proj_dim)
+
+        if has_clean_x_embedder:
+            self.install_clean_x_embedder()
+
+        self.high_quality_fp32_output_for_inference = False
+
 
 class HunyuanAttnProcessorFlashAttnDouble:
     def __call__(self, attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb):
@@ -211,6 +291,131 @@ class HunyuanAttnProcessorFlashAttnSingle:
         hidden_states = attn_varlen_func(query, key, value, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
         hidden_states = hidden_states.flatten(-2)
 
+        hidden_states, encoder_hidden_states = hidden_states[:, :-txt_length], hidden_states[:, -txt_length:]
+
+        return hidden_states, encoder_hidden_states
+
+
+class HunyuanAttnProcessorSageAttnDouble:
+    def __call__(self, attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb):
+        if not SAGEATTN_AVAILABLE:
+            raise ImportError("SageAttention is not installed. Please install it first.")
+            
+        cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = attention_mask
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
+
+        query = query.unflatten(2, (attn.heads, -1))
+        key = key.unflatten(2, (attn.heads, -1))
+        value = value.unflatten(2, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        query = apply_rotary_emb_transposed(query, image_rotary_emb)
+        key = apply_rotary_emb_transposed(key, image_rotary_emb)
+
+        encoder_query = attn.add_q_proj(encoder_hidden_states)
+        encoder_key = attn.add_k_proj(encoder_hidden_states)
+        encoder_value = attn.add_v_proj(encoder_hidden_states)
+
+        encoder_query = encoder_query.unflatten(2, (attn.heads, -1))
+        encoder_key = encoder_key.unflatten(2, (attn.heads, -1))
+        encoder_value = encoder_value.unflatten(2, (attn.heads, -1))
+
+        encoder_query = attn.norm_added_q(encoder_query)
+        encoder_key = attn.norm_added_k(encoder_key)
+
+        # Combine queries, keys, and values
+        query_combined = torch.cat([query, encoder_query], dim=1)
+        key_combined = torch.cat([key, encoder_key], dim=1)
+        value_combined = torch.cat([value, encoder_value], dim=1)
+        
+        # Reshape for SageAttention: (batch, seq_len, heads, head_dim) -> (batch, heads, seq_len, head_dim)
+        query_combined = query_combined.transpose(1, 2)
+        key_combined = key_combined.transpose(1, 2)
+        value_combined = value_combined.transpose(1, 2)
+        
+        # Apply SageAttention
+        hidden_states = sageattn(
+            query_combined, 
+            key_combined, 
+            value_combined,
+            tensor_layout="HND",
+            is_causal=False  # HunyuanVideo doesn't use causal attention
+        )
+        
+        # Reshape back
+        hidden_states = hidden_states.transpose(1, 2)  # (batch, seq_len, heads, head_dim)
+        hidden_states = hidden_states.flatten(-2)  # (batch, seq_len, hidden_size)
+
+        txt_length = encoder_hidden_states.shape[1]
+        hidden_states, encoder_hidden_states = hidden_states[:, :-txt_length], hidden_states[:, -txt_length:]
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+        return hidden_states, encoder_hidden_states
+
+
+class HunyuanAttnProcessorSageAttnSingle:
+    def __call__(self, attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb):
+        if not SAGEATTN_AVAILABLE:
+            raise ImportError("SageAttention is not installed. Please install it first.")
+            
+        cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = attention_mask
+
+        # Combine hidden states and encoder hidden states
+        combined_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+        
+        # Get queries, keys, and values
+        query = attn.to_q(combined_states)
+        key = attn.to_k(combined_states)
+        value = attn.to_v(combined_states)
+        
+        # Reshape for multi-head attention
+        batch_size = query.shape[0]
+        query = query.unflatten(2, (attn.heads, -1))
+        key = key.unflatten(2, (attn.heads, -1))
+        value = value.unflatten(2, (attn.heads, -1))
+        
+        # Apply layer norms
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+        
+        # Apply rotary embeddings to non-text tokens
+        txt_length = encoder_hidden_states.shape[1]
+        query = torch.cat([
+            apply_rotary_emb_transposed(query[:, :-txt_length], image_rotary_emb), 
+            query[:, -txt_length:]
+        ], dim=1)
+        key = torch.cat([
+            apply_rotary_emb_transposed(key[:, :-txt_length], image_rotary_emb), 
+            key[:, -txt_length:]
+        ], dim=1)
+        
+        # Reshape for SageAttention: (batch, seq_len, heads, head_dim) -> (batch, heads, seq_len, head_dim)
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        
+        # Apply SageAttention
+        hidden_states = sageattn(
+            query, 
+            key, 
+            value,
+            tensor_layout="HND",
+            is_causal=False  # HunyuanVideo doesn't use causal attention
+        )
+        
+        # Reshape back
+        hidden_states = hidden_states.transpose(1, 2)  # (batch, seq_len, heads, head_dim)
+        hidden_states = hidden_states.flatten(-2)  # (batch, seq_len, hidden_size)
+        
+        # Split hidden states back
         hidden_states, encoder_hidden_states = hidden_states[:, :-txt_length], hidden_states[:, -txt_length:]
 
         return hidden_states, encoder_hidden_states
@@ -538,11 +743,20 @@ class HunyuanVideoSingleTransformerBlock(nn.Module):
         attention_head_dim: int,
         mlp_ratio: float = 4.0,
         qk_norm: str = "rms_norm",
+        use_sage_attention: bool = False,
     ) -> None:
         super().__init__()
 
         hidden_size = num_attention_heads * attention_head_dim
         mlp_dim = int(hidden_size * mlp_ratio)
+        
+        # Choose the attention processor based on availability and preference
+        if use_sage_attention and SAGEATTN_AVAILABLE:
+            processor = HunyuanAttnProcessorSageAttnSingle()
+            print("Using SageAttention for single transformer block")
+        else:
+            processor = HunyuanAttnProcessorFlashAttnSingle()
+            print("Using FlashAttention for single transformer block")
 
         self.attn = Attention(
             query_dim=hidden_size,
@@ -551,7 +765,7 @@ class HunyuanVideoSingleTransformerBlock(nn.Module):
             heads=num_attention_heads,
             out_dim=hidden_size,
             bias=True,
-            processor=HunyuanAttnProcessorFlashAttnSingle(),
+            processor=processor,
             qk_norm=qk_norm,
             eps=1e-6,
             pre_only=True,
@@ -612,6 +826,7 @@ class HunyuanVideoTransformerBlock(nn.Module):
         attention_head_dim: int,
         mlp_ratio: float,
         qk_norm: str = "rms_norm",
+        use_sage_attention: bool = False,
     ) -> None:
         super().__init__()
 
@@ -619,6 +834,14 @@ class HunyuanVideoTransformerBlock(nn.Module):
 
         self.norm1 = AdaLayerNormZero(hidden_size, norm_type="layer_norm")
         self.norm1_context = AdaLayerNormZero(hidden_size, norm_type="layer_norm")
+        
+        # Choose the attention processor based on availability and preference
+        if use_sage_attention and SAGEATTN_AVAILABLE:
+            processor = HunyuanAttnProcessorSageAttnDouble()
+            print("Using SageAttention for transformer block")
+        else:
+            processor = HunyuanAttnProcessorFlashAttnDouble()
+            print("Using FlashAttention for transformer block")
 
         self.attn = Attention(
             query_dim=hidden_size,
@@ -629,7 +852,7 @@ class HunyuanVideoTransformerBlock(nn.Module):
             out_dim=hidden_size,
             context_pre_only=False,
             bias=True,
-            processor=HunyuanAttnProcessorFlashAttnDouble(),
+            processor=processor,
             qk_norm=qk_norm,
             eps=1e-6,
         )
@@ -747,6 +970,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         has_image_proj=False,
         image_proj_dim=1152,
         has_clean_x_embedder=False,
+        use_sage_attention: bool = False,
     ) -> None:
         super().__init__()
 
@@ -770,7 +994,8 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.transformer_blocks = nn.ModuleList(
             [
                 HunyuanVideoTransformerBlock(
-                    num_attention_heads, attention_head_dim, mlp_ratio=mlp_ratio, qk_norm=qk_norm
+                    num_attention_heads, attention_head_dim, mlp_ratio=mlp_ratio, qk_norm=qk_norm,
+                    use_sage_attention=use_sage_attention
                 )
                 for _ in range(num_layers)
             ]
@@ -780,7 +1005,8 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.single_transformer_blocks = nn.ModuleList(
             [
                 HunyuanVideoSingleTransformerBlock(
-                    num_attention_heads, attention_head_dim, mlp_ratio=mlp_ratio, qk_norm=qk_norm
+                    num_attention_heads, attention_head_dim, mlp_ratio=mlp_ratio, qk_norm=qk_norm,
+                    use_sage_attention=use_sage_attention
                 )
                 for _ in range(num_single_layers)
             ]
