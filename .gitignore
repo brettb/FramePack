@@ -1,6 +1,8 @@
 hf_download/
 outputs/
 repo/
+scripts/
+hunyuanvideo_model/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
