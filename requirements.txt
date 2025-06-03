@@ -17,7 +17,7 @@ einops>=0.7.0
 opencv-contrib-python>=4.8.0
 safetensors>=0.5.3
 triton>=3.0.0
-# flash-attn>=2.5.0  # Commenting out since we are using SageAttention now
+# flash-attn>=2.5.3  # Enabled as a fallback for when SageAttention is not available
 # SageAttention - Install from source using install_sageattention_compat.sh for 2.1.1 or later  
 # git+https://github.com/thu-ml/SageAttention.git
 # Or just uncomment this line for the older version
